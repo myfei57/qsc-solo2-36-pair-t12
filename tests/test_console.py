@@ -286,6 +286,86 @@ def test_trail_endpoints_record_and_describe(router, unit) -> None:
     assert router.handle("GET", "/api/trail", {"unit": [unit]}, {})[1]
 
 
+def test_each_refusal_kind_is_distinguishable_on_the_wire(router, unit) -> None:
+    limit = router.handle(
+        "POST", "/api/feed/position", {}, {"unit": unit, "position": 900}
+    )
+    gate = router.handle("POST", "/api/feed/open", {}, {"unit": unit, "ticket": "cfm-z"})
+    router.handle("POST", "/api/batch/open", {}, {"batchId": "b1", "unit": unit})
+    duplicate = router.handle(
+        "POST", "/api/batch/open", {}, {"batchId": "b1", "unit": unit}
+    )
+
+    assert limit[0] == 409 and limit[1]["code"] == "limit_violation"
+    assert gate[0] == 409 and gate[1]["code"] == "gate_blocked"
+    assert duplicate[0] == 409 and duplicate[1]["code"] == "duplicate"
+
+
+def test_a_refused_action_leaves_a_trail_entry_with_its_reason(router, line, unit) -> None:
+    status, payload = router.handle(
+        "POST", "/api/feed/position", {}, {"unit": unit, "position": 900}
+    )
+
+    assert status == 409
+    entry = line.audit.latest("feed.position.rejected")
+    assert entry is not None
+    assert entry["payload"]["unit"] == unit
+    assert entry["payload"]["outcome"] == "rejected"
+    assert entry["payload"]["code"] == "limit_violation"
+    assert entry["payload"]["reason"] == "limit_violation"
+    assert entry["payload"]["context"]["high"] == 100
+    assert "rejected" in line.audit.describe(entry)
+    # The rejected attempt changed no state but still counts on the unit trail.
+    assert line.audit.by_unit_and_kind(unit, "feed.position.rejected") == [entry]
+
+
+def test_expired_and_duplicate_refusals_leave_distinct_trail_entries(
+    router, line, unit
+) -> None:
+    ticket = feed_ticket(line, window=1)
+    for index in range(5):
+        line.audit.record("note", unit, f"keep the clock moving {index}")
+    expired = router.handle("POST", "/api/confirm/consume", {}, {"ticket": ticket})
+    router.handle("POST", "/api/batch/open", {}, {"batchId": "b9", "unit": unit})
+    duplicate = router.handle(
+        "POST", "/api/batch/open", {}, {"batchId": "b9", "unit": unit}
+    )
+
+    assert expired[1]["code"] == "expired_credential"
+    assert duplicate[1]["code"] == "duplicate"
+    assert (
+        line.audit.latest("confirm.consume.rejected")["payload"]["code"]
+        == "expired_credential"
+    )
+    assert (
+        line.audit.latest("batch.open.rejected")["payload"]["code"] == "duplicate"
+    )
+
+
+def test_malformed_and_read_only_refusals_are_not_put_on_the_trail(router, line, unit) -> None:
+    before = line.audit.total()
+
+    bad_status, bad_payload = router.handle("POST", "/api/feed/close", {}, {})
+    missing = router.handle("GET", "/api/diagnostics", {}, {})
+
+    assert bad_status == 400 and bad_payload["code"] == "validation"
+    assert missing[0] == 400 and missing[1]["code"] == "validation"
+    assert line.audit.total() == before
+
+
+def test_refusal_trail_survives_a_restart(router, line, unit) -> None:
+    from tests.support import open_line
+
+    router.handle("POST", "/api/feed/position", {}, {"unit": unit, "position": 900})
+
+    reopened = open_line(line.data_dir.parent)
+
+    entry = reopened.audit.latest("feed.position.rejected")
+    assert entry is not None
+    assert entry["payload"]["code"] == "limit_violation"
+    assert reopened.stream.pending_count == 0
+
+
 def test_exhaust_and_drive_endpoints_report_their_modules(router, unit) -> None:
     verdict = router.handle("GET", "/api/comb/verdict", {"unit": [unit]}, {})
     margin = router.handle("GET", "/api/bleed/margin", {"unit": [unit], "load": ["10"]}, {})

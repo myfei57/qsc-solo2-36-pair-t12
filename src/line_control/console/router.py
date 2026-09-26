@@ -14,13 +14,15 @@ from line_control.runtime.errors import ControlError, ValidationError, http_stat
 Query = Mapping[str, list[str]]
 Body = Mapping[str, Any]
 Handler = Callable[[Query, Body], tuple[int, Any]]
+RefusalListener = Callable[[str, str, Query, Body, ControlError], None]
 
 
 class Router:
     """A method and path table over a set of handlers."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_refusal: RefusalListener | None = None) -> None:
         self._routes: dict[tuple[str, str], Handler] = {}
+        self._on_refusal = on_refusal
 
     def add(self, method: str, path: str, handler: Handler) -> None:
         """Register one route."""
@@ -46,18 +48,38 @@ class Router:
         body: Body | None = None,
     ) -> tuple[int, Any]:
         """Dispatch a request and never leak an exception to the transport."""
-        handler = self._routes.get((method.upper(), self._normalise(path)))
+        active_query = query or {}
+        active_body = body or {}
+        normalised = self._normalise(path)
+        handler = self._routes.get((method.upper(), normalised))
         if handler is None:
             return 404, {
                 "error": f"no route for {method.upper()} {path}",
                 "code": "unknown_route",
             }
         try:
-            return handler(query or {}, body or {})
+            return handler(active_query, active_body)
         except ControlError as refusal:
+            self._notify_refusal(method, normalised, active_query, active_body, refusal)
             return http_status(refusal), refusal.to_dict()
         except (KeyError, TypeError, ValueError) as malformed:
             return 400, {"error": str(malformed), "code": "validation"}
+
+    def _notify_refusal(
+        self,
+        method: str,
+        path: str,
+        query: Query,
+        body: Body,
+        refusal: ControlError,
+    ) -> None:
+        """Hand a deliberate refusal to the trail listener without masking it."""
+        if self._on_refusal is None:
+            return
+        try:
+            self._on_refusal(method, path, query, body, refusal)
+        except Exception:  # pragma: no cover - auditing must not change the verdict
+            pass
 
     @staticmethod
     def _normalise(path: str) -> str:

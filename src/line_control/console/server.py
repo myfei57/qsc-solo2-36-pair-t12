@@ -8,14 +8,57 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from line_control.console.handlers import Handlers
-from line_control.console.router import Router
+from line_control.console.router import Query, Router
 from line_control.line.supervisor import LineSupervisor
+from line_control.runtime.errors import ControlError, http_status
+
+# Read-only routes never attempt a state change, so a refusal there is not an
+# action that needs to appear on the operator trail.
+AUDITED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# Malformed arguments (400) are caller mistakes rather than process refusals;
+# the trail keeps limit, expiry, duplicate, latch and unknown-unit rejections.
+AUDITED_MIN_STATUS = 409
+
+
+def _action_name(path: str) -> str:
+    """Turn an API path into the trace kind used for an attempted action."""
+    segments = [segment for segment in path.split("/") if segment and segment != "api"]
+    if not segments:
+        return "command"
+    # Expand the short module prefix used by the URL table
+    # (comp -> compressor, ign -> ignition, comb -> combustion, gen -> drive).
+    modules = {"comp": "compressor", "ign": "ignition", "comb": "combustion", "gen": "drive"}
+    if segments[0] in modules:
+        segments[0] = modules[segments[0]]
+    return ".".join(segment.replace("-", "_") for segment in segments) + ".rejected"
+
+
+def _record_refusal(supervisor: LineSupervisor):
+    """Build the listener that leaves a trail entry for a refused action."""
+
+    def listener(method: str, path: str, query: Query, body: Any, refusal: ControlError) -> None:
+        if method.upper() not in AUDITED_METHODS:
+            return
+        if http_status(refusal) < AUDITED_MIN_STATUS:
+            return
+        unit = body.get("unit") if isinstance(body, dict) else None
+        if not isinstance(unit, str) or not unit:
+            unit = ""
+        supervisor.audit.record_refusal(
+            _action_name(path),
+            unit,
+            refusal.code,
+            refusal.message,
+            context=refusal.context,
+        )
+
+    return listener
 
 
 def build_router(supervisor: LineSupervisor) -> Router:
     """Bind every console route to one supervisor."""
     handlers = Handlers(supervisor)
-    router = Router()
+    router = Router(on_refusal=_record_refusal(supervisor))
     router.add("GET", "/", handlers.index)
     router.add("GET", "/healthz", handlers.health)
     router.add("GET", "/api/health", handlers.health)
