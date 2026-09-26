@@ -210,16 +210,30 @@ class Handlers:
         recorder = self._supervisor.audit
         unit = _first(query, "unit")
         kind = _first(query, "kind")
+        outcome = _first(query, "outcome")
         limit = int(_first(query, "limit") or 0)
+        newest_first = _first(query, "order") in {"newest", "desc"}
         if unit is not None and kind is not None:
-            return OK, recorder.by_unit_and_kind(unit, kind)
-        if unit is not None and limit:
-            return OK, recorder.trail(unit, limit=limit)
-        if unit is not None:
-            return OK, recorder.by_unit(unit)
-        if kind is not None:
-            return OK, recorder.by_kind(kind)
-        return OK, recorder.query()
+            records = recorder.by_unit_and_kind(unit, kind)
+        elif unit is not None and limit:
+            records = recorder.trail(unit, limit=limit)
+        elif unit is not None:
+            records = recorder.by_unit(unit)
+        elif kind is not None:
+            records = recorder.by_kind(kind)
+        elif limit:
+            records = recorder.recent(limit=limit)
+        else:
+            records = recorder.query()
+        if outcome is not None:
+            records = [
+                record
+                for record in records
+                if record["payload"].get("outcome") == outcome
+            ]
+        if newest_first:
+            records = list(reversed(records))
+        return OK, records
 
     def trail_latest(self, query: Query, body: Body) -> Response:
         """Return the newest trace record of one kind."""

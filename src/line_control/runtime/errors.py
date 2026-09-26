@@ -131,4 +131,4 @@ STATUS_BY_CODE: dict[str, int] = {
 
 def http_status(error: ControlError) -> int:
     """Return the transport status for a refusal."""
-    return 400
+    return STATUS_BY_CODE.get(error.code, 409)

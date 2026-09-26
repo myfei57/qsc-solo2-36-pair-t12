@@ -8,14 +8,34 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from line_control.console.handlers import Handlers
-from line_control.console.router import Router
+from line_control.console.router import RefusalEvent, Router
 from line_control.line.supervisor import LineSupervisor
 
 
 def build_router(supervisor: LineSupervisor) -> Router:
     """Bind every console route to one supervisor."""
     handlers = Handlers(supervisor)
-    router = Router()
+
+    def record_refusal(event: RefusalEvent) -> None:
+        """Leave a trail entry for every refused command.
+
+        Read-only queries are not commands, so a refused GET is answered but
+        not audited; only action verbs enter the trail.
+        """
+        if event.method == "GET":
+            return
+        supervisor.audit.record_refusal(
+            action=event.path,
+            unit=event.unit(),
+            reason=event.code,
+            detail=f"{event.method} {event.path} refused: {event.message}",
+            status=event.status,
+            method=event.method,
+            path=event.path,
+            context=dict(event.context),
+        )
+
+    router = Router(on_refusal=record_refusal)
     router.add("GET", "/", handlers.index)
     router.add("GET", "/healthz", handlers.health)
     router.add("GET", "/api/health", handlers.health)
